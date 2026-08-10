@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  GOPRIVATE: github.com/Muxcore-Media/*
+
+jobs:
+  lint:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Configure private modules (HTTPS)
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.MUXCORE_CI_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: go vet ./...
+
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Configure private modules (HTTPS)
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.MUXCORE_CI_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: go test -count=1 -timeout 10m ./...
+
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Configure private modules (HTTPS)
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.MUXCORE_CI_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: |
+          CGO_ENABLED=0 go build -o /dev/null ./cmd/module
+          CGO_ENABLED=0 go build -o /dev/null ./cmd/local-demo
+          go vet ./...
