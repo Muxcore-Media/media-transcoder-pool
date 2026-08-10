@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package muxcore.transcoderpool.v1;
+
+option go_package = "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1;transcoderpoolv1";
+
+// TranscoderPoolService coordinates distributed transcode workers on the mesh.
+service TranscoderPoolService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc UnregisterWorker(UnregisterWorkerRequest) returns (UnregisterWorkerResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+}
+
+message Worker {
+  string id = 1;
+  string node_id = 2;
+  string grpc_addr = 3;
+  bool gpu = 4;
+  int32 capacity = 5;
+  int32 active_jobs = 6;
+  repeated string labels = 7;
+  int64 last_heartbeat_unix = 8;
+  string status = 9; // online | stale | offline
+}
+
+message Job {
+  string id = 1;
+  string input_path = 2;
+  string output_path = 3;
+  string profile = 4;
+  bool prefer_gpu = 5;
+  string worker_id = 6;
+  string status = 7; // queued | assigned | running | done | failed | cancelled
+  string error = 8;
+  int64 created_unix = 9;
+  int64 updated_unix = 10;
+}
+
+message RegisterWorkerRequest {
+  string id = 1;
+  string node_id = 2;
+  string grpc_addr = 3;
+  bool gpu = 4;
+  int32 capacity = 5;
+  repeated string labels = 6;
+}
+message RegisterWorkerResponse { Worker worker = 1; }
+
+message HeartbeatRequest {
+  string id = 1;
+  int32 active_jobs = 2;
+}
+message HeartbeatResponse { bool ok = 1; }
+
+message UnregisterWorkerRequest { string id = 1; }
+message UnregisterWorkerResponse { bool success = 1; }
+
+message ListWorkersRequest { bool gpu_only = 1; }
+message ListWorkersResponse { repeated Worker workers = 1; }
+
+message EnqueueRequest {
+  string input_path = 1;
+  string output_path = 2;
+  string profile = 3;
+  bool prefer_gpu = 4;
+}
+message EnqueueResponse { Job job = 1; }
+
+message GetJobRequest { string id = 1; }
+message GetJobResponse { Job job = 1; }
+
+message ListJobsRequest { string status = 1; }
+message ListJobsResponse { repeated Job jobs = 1; }
+
+message CancelJobRequest { string id = 1; }
+message CancelJobResponse { bool success = 1; }
