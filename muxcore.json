@@ -1,8 +1,8 @@
 {
   "id": "media-transcoder-pool",
   "name": "Transcoder Pool",
-  "version": "0.1.0",
-  "description": "Distributed transcoding pool coordinator scaffold",
+  "version": "0.2.0",
+  "description": "Distributed transcoding pool coordinator with durable SQLite job queue",
   "roles": ["media", "transcode", "pool"],
   "capabilities": ["media.transcode.pool", "transcoder.pool", "settings"]
 }
