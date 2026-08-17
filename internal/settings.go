@@ -28,6 +28,8 @@ func (m *Module) UpdateSetting(key, value string) error {
 		return fmt.Errorf("stale_after_sec must be positive int")
 	}
 	m.staleAfterSec = n
-	m.store = NewStore(n) // reset store with new threshold (scaffold; durable pool is follow-up)
+	if m.store != nil {
+		m.store.SetStaleAfterSec(n)
+	}
 	return nil
 }

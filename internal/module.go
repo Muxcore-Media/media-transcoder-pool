@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 
@@ -18,18 +19,21 @@ import (
 )
 
 type Module struct {
-	id, grpcAddr, httpAddr string
-	staleAfterSec          int64
-	cfgMu                  sync.RWMutex
-	store                  *Store
-	grpcSrv                *grpc.Server
-	lis                    net.Listener
-	httpSrv                *http.Server
+	id, grpcAddr, httpAddr, dbPath string
+	staleAfterSec                  int64
+	dispatch                       bool
+	cfgMu                          sync.RWMutex
+	store                          *Store
+	grpcSrv                        *grpc.Server
+	lis                            net.Listener
+	httpSrv                        *http.Server
+	dispCancel                     context.CancelFunc
 }
 
 type Config struct {
-	ID, GRPCAddr, HTTPAddr string
-	StaleAfterSec          int64
+	ID, GRPCAddr, HTTPAddr, DBPath string
+	StaleAfterSec                  int64
+	Dispatch                       bool // forward assigned jobs to worker TranscodeService
 }
 
 func NewModule(cfg Config) *Module {
@@ -50,18 +54,27 @@ func NewModule(cfg Config) *Module {
 			cfg.StaleAfterSec = n
 		}
 	}
+	if v := os.Getenv("POOL_DB_PATH"); v != "" {
+		cfg.DBPath = v
+	}
 	if v := os.Getenv("MUXCORE_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
 	}
+	if v := os.Getenv("POOL_DISPATCH"); v == "1" || v == "true" {
+		cfg.Dispatch = true
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = filepath.Join("data", "pool.db")
+	}
 	return &Module{
 		id: cfg.ID, grpcAddr: cfg.GRPCAddr, httpAddr: cfg.HTTPAddr,
-		staleAfterSec: cfg.StaleAfterSec, store: NewStore(cfg.StaleAfterSec),
+		dbPath: cfg.DBPath, staleAfterSec: cfg.StaleAfterSec, dispatch: cfg.Dispatch,
 	}
 }
 
 func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
-		ID: m.id, Name: "Transcoder Pool", Version: "0.1.0",
+		ID: m.id, Name: "Transcoder Pool", Version: "0.2.0",
 		Roles:        []string{"media", "transcode", "pool"},
 		Description:  "Distributed transcoding pool coordinator (GPU/CPU workers on the mesh)",
 		Capabilities: []string{"media.transcode.pool", "transcoder.pool", "settings"},
@@ -69,14 +82,26 @@ func (m *Module) Info() contracts.ModuleInfo {
 	}
 }
 
-func (m *Module) Init(ctx context.Context) error { return nil }
+func (m *Module) Init(ctx context.Context) error {
+	store, err := OpenStore(m.dbPath, m.staleAfterSec)
+	if err != nil {
+		return err
+	}
+	m.store = store
+	slog.Info("transcoder-pool durable store open", "db", store.Path())
+	return nil
+}
 
 func (m *Module) Start(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("store not initialized")
+	}
 	lis, err := net.Listen("tcp", m.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("listen gRPC %s: %w", m.grpcAddr, err)
 	}
 	m.lis = lis
+	m.grpcAddr = lis.Addr().String()
 	m.grpcSrv = grpc.NewServer()
 	poolv1.RegisterTranscoderPoolServiceServer(m.grpcSrv, &poolServer{m: m})
 	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
@@ -91,27 +116,53 @@ func (m *Module) Start(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	m.httpSrv = &http.Server{Addr: m.httpAddr, Handler: mux}
+	httpLis, err := net.Listen("tcp", m.httpAddr)
+	if err != nil {
+		m.grpcSrv.GracefulStop()
+		return fmt.Errorf("listen HTTP %s: %w", m.httpAddr, err)
+	}
+	m.httpAddr = httpLis.Addr().String()
+	m.httpSrv = &http.Server{Handler: mux}
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
 			slog.Error("health serve", "error", err)
 		}
 	}()
+	if m.dispatch {
+		dctx, cancel := context.WithCancel(context.Background())
+		m.dispCancel = cancel
+		go NewDispatcher(m.store, GRPCTranscoderDialer).Run(dctx)
+		slog.Info("transcoder-pool dispatcher enabled")
+	}
 	return nil
 }
 
 func (m *Module) Stop(ctx context.Context) error {
+	if m.dispCancel != nil {
+		m.dispCancel()
+		m.dispCancel = nil
+	}
 	if m.grpcSrv != nil {
 		m.grpcSrv.GracefulStop()
 	}
 	if m.httpSrv != nil {
 		_ = m.httpSrv.Shutdown(ctx)
 	}
+	if m.store != nil {
+		_ = m.store.Close()
+		m.store = nil
+	}
 	return nil
 }
 
 func (m *Module) Health(ctx context.Context) error { return nil }
+
+// GRPCAddr returns the bound gRPC listen address.
+func (m *Module) GRPCAddr() string { return m.grpcAddr }
+
+// Store returns the durable store (nil before Init).
+func (m *Module) Store() *Store { return m.store }
 
 type poolServer struct {
 	poolv1.UnimplementedTranscoderPoolServiceServer

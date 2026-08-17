@@ -1,0 +1,127 @@
+syntax = "proto3";
+package muxcore.transcoder.v1;
+option go_package = "github.com/Muxcore-Media/media-transcoder/proto/transcodev1;transcodev1";
+
+service TranscodeService {
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc CreateProfile(CreateProfileRequest) returns (CreateProfileResponse);
+  rpc UpdateProfile(UpdateProfileRequest) returns (UpdateProfileResponse);
+  rpc DeleteProfile(DeleteProfileRequest) returns (DeleteProfileResponse);
+
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc DetectHardware(DetectHardwareRequest) returns (DetectHardwareResponse);
+}
+
+// ── Profiles ───────────────────────────────────────────────────
+
+message TranscodeProfile {
+  string id = 1;
+  string name = 2;
+  string video_codec = 3;     // "h264", "hevc", "av1"
+  string audio_codec = 4;     // "copy", "aac", "opus", "ac3"
+  string preset = 5;          // "fast", "medium", "slow", "veryslow"
+  int32 crf = 6;              // 0-51, lower = better quality
+  int32 max_width = 7;        // 0 = original
+  int32 max_height = 8;       // 0 = original
+  bool use_gpu = 9;
+  string container = 10;      // "mkv", "mp4"
+  string created_at = 11;
+  string updated_at = 12;
+}
+
+message ListProfilesRequest {}
+message ListProfilesResponse { repeated TranscodeProfile profiles = 1; }
+
+message CreateProfileRequest {
+  string name = 1;
+  string video_codec = 2;
+  string audio_codec = 3;
+  string preset = 4;
+  int32 crf = 5;
+  int32 max_width = 6;
+  int32 max_height = 7;
+  bool use_gpu = 8;
+  string container = 9;
+}
+
+message CreateProfileResponse { TranscodeProfile profile = 1; }
+
+message UpdateProfileRequest {
+  string id = 1;
+  string name = 2;
+  string video_codec = 3;
+  string audio_codec = 4;
+  string preset = 5;
+  int32 crf = 6;
+  int32 max_width = 7;
+  int32 max_height = 8;
+  bool use_gpu = 9;
+  string container = 10;
+}
+
+message UpdateProfileResponse { TranscodeProfile profile = 1; }
+
+message DeleteProfileRequest { string id = 1; }
+message DeleteProfileResponse {}
+
+// ── Jobs ───────────────────────────────────────────────────────
+
+message EnqueueRequest {
+  string input_path = 1;
+  string output_path = 2;
+  string profile_id = 3;
+}
+
+message EnqueueResponse {
+  string job_id = 1;
+}
+
+message CancelJobRequest { string job_id = 1; }
+message CancelJobResponse {}
+
+message ListJobsRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+  string status = 3;  // "all", "queued", "running", "completed", "failed", "cancelled"
+}
+
+message ListJobsResponse {
+  repeated TranscodeJob jobs = 1;
+  int32 total = 2;
+  int32 page = 3;
+  int32 page_size = 4;
+}
+
+message GetJobRequest { string job_id = 1; }
+message GetJobResponse { TranscodeJob job = 1; }
+
+message TranscodeJob {
+  string id = 1;
+  string input_path = 2;
+  string output_path = 3;
+  string profile_id = 4;
+  string profile_name = 5;
+  string status = 6;          // "queued", "running", "completed", "failed", "cancelled"
+  double progress = 7;        // 0.0 - 1.0
+  double fps = 8;
+  string error = 9;
+  string started_at = 10;
+  string completed_at = 11;
+  string created_at = 12;
+  string updated_at = 13;
+}
+
+message DetectHardwareRequest {}
+message DetectHardwareResponse {
+  repeated HardwareDevice devices = 1;
+}
+
+message HardwareDevice {
+  string name = 1;
+  string type = 2;      // "nvenc", "vaapi", "qsv", "videotoolbox"
+  bool available = 3;
+  string encoder = 4;   // "h264_nvenc", "hevc_nvenc", etc.
+}

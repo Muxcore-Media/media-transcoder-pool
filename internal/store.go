@@ -1,24 +1,29 @@
 package internal
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
 )
 
 type Worker struct {
-	ID                 string
-	NodeID             string
-	GRPCAddr           string
-	GPU                bool
-	Capacity           int32
-	ActiveJobs         int32
-	Labels             []string
-	LastHeartbeatUnix  int64
-	Status             string
+	ID                string
+	NodeID            string
+	GRPCAddr          string
+	GPU               bool
+	Capacity          int32
+	ActiveJobs        int32
+	Labels            []string
+	LastHeartbeatUnix int64
+	Status            string
 }
 
 type Job struct {
@@ -34,22 +39,100 @@ type Job struct {
 	UpdatedUnix int64
 }
 
+// Store is a durable SQLite-backed worker registry and job queue.
 type Store struct {
-	mu              sync.RWMutex
-	workers         map[string]*Worker
-	jobs            map[string]*Job
-	staleAfterSec   int64
+	mu            sync.Mutex
+	db            *sql.DB
+	path          string
+	staleAfterSec int64
 }
 
-func NewStore(staleAfterSec int64) *Store {
+// OpenStore opens or creates a SQLite database at path (WAL mode).
+func OpenStore(path string, staleAfterSec int64) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("db path required")
+	}
 	if staleAfterSec <= 0 {
 		staleAfterSec = 60
 	}
-	return &Store{
-		workers:       map[string]*Worker{},
-		jobs:          map[string]*Job{},
-		staleAfterSec: staleAfterSec,
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create db directory: %w", err)
 	}
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+	s := &Store{db: db, path: path, staleAfterSec: staleAfterSec}
+	if err := s.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS workers (
+			id TEXT PRIMARY KEY,
+			node_id TEXT NOT NULL DEFAULT '',
+			grpc_addr TEXT NOT NULL,
+			gpu INTEGER NOT NULL DEFAULT 0,
+			capacity INTEGER NOT NULL DEFAULT 1,
+			active_jobs INTEGER NOT NULL DEFAULT 0,
+			labels TEXT NOT NULL DEFAULT '[]',
+			last_heartbeat_unix INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'online'
+		);
+		CREATE TABLE IF NOT EXISTS jobs (
+			id TEXT PRIMARY KEY,
+			input_path TEXT NOT NULL,
+			output_path TEXT NOT NULL,
+			profile TEXT NOT NULL DEFAULT 'h264_fast',
+			prefer_gpu INTEGER NOT NULL DEFAULT 0,
+			worker_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'queued',
+			error TEXT NOT NULL DEFAULT '',
+			created_unix INTEGER NOT NULL DEFAULT 0,
+			updated_unix INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+		CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
+	`)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// Path returns the SQLite file path.
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+// Close closes the database.
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+// SetStaleAfterSec updates the heartbeat stale threshold without resetting data.
+func (s *Store) SetStaleAfterSec(n int64) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.staleAfterSec = n
 }
 
 func (s *Store) RegisterWorker(w Worker) (*Worker, error) {
@@ -64,64 +147,97 @@ func (s *Store) RegisterWorker(w Worker) (*Worker, error) {
 	if w.Capacity <= 0 {
 		w.Capacity = 1
 	}
+	if w.Labels == nil {
+		w.Labels = []string{}
+	}
 	now := time.Now().Unix()
 	w.LastHeartbeatUnix = now
 	w.Status = "online"
-	cp := w
-	s.workers[cp.ID] = &cp
-	out := cp
-	return &out, nil
+	labels, err := json.Marshal(w.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("marshal labels: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO workers (id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status)
+		VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'online')
+		ON CONFLICT(id) DO UPDATE SET
+			node_id = excluded.node_id,
+			grpc_addr = excluded.grpc_addr,
+			gpu = excluded.gpu,
+			capacity = excluded.capacity,
+			labels = excluded.labels,
+			last_heartbeat_unix = excluded.last_heartbeat_unix,
+			status = 'online'
+	`, w.ID, w.NodeID, w.GRPCAddr, boolToInt(w.GPU), w.Capacity, string(labels), now)
+	if err != nil {
+		return nil, fmt.Errorf("upsert worker: %w", err)
+	}
+	out, err := s.getWorkerLocked(w.ID, now)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) Heartbeat(id string, active int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	w, ok := s.workers[id]
-	if !ok {
+	res, err := s.db.Exec(`
+		UPDATE workers SET active_jobs = ?, last_heartbeat_unix = ?, status = 'online' WHERE id = ?
+	`, active, time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("worker %q not found", id)
 	}
-	w.ActiveJobs = active
-	w.LastHeartbeatUnix = time.Now().Unix()
-	w.Status = "online"
 	return nil
 }
 
 func (s *Store) UnregisterWorker(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.workers[id]; !ok {
+	res, err := s.db.Exec(`DELETE FROM workers WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("unregister: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("worker %q not found", id)
 	}
-	delete(s.workers, id)
 	return nil
-}
-
-func (s *Store) refreshStatusesLocked(now int64) {
-	for _, w := range s.workers {
-		age := now - w.LastHeartbeatUnix
-		switch {
-		case age > s.staleAfterSec*2:
-			w.Status = "offline"
-		case age > s.staleAfterSec:
-			w.Status = "stale"
-		default:
-			w.Status = "online"
-		}
-	}
 }
 
 func (s *Store) ListWorkers(gpuOnly bool) []*Worker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	s.refreshStatusesLocked(now)
-	out := make([]*Worker, 0, len(s.workers))
-	for _, w := range s.workers {
+	rows, err := s.db.Query(`
+		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
+		FROM workers ORDER BY id
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]*Worker, 0)
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return out
+		}
+		w.Status = statusFor(w.LastHeartbeatUnix, now, s.staleAfterSec)
 		if gpuOnly && !w.GPU {
 			continue
 		}
-		cp := *w
-		out = append(out, &cp)
+		out = append(out, w)
 	}
 	return out
 }
@@ -133,7 +249,6 @@ func (s *Store) Enqueue(j Job) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	s.refreshStatusesLocked(now)
 	if j.ID == "" {
 		j.ID = "tj_" + uuid.NewString()[:8]
 	}
@@ -143,24 +258,57 @@ func (s *Store) Enqueue(j Job) (*Job, error) {
 	j.CreatedUnix = now
 	j.UpdatedUnix = now
 	j.Status = "queued"
+	j.WorkerID = ""
 
-	workerID := s.pickWorkerLocked(j.PreferGPU)
+	workerID, err := s.pickWorkerLocked(j.PreferGPU, now)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	if workerID != "" {
 		j.WorkerID = workerID
 		j.Status = "assigned"
-		s.workers[workerID].ActiveJobs++
+		if _, err := tx.Exec(`UPDATE workers SET active_jobs = active_jobs + 1 WHERE id = ?`, workerID); err != nil {
+			return nil, fmt.Errorf("bump worker load: %w", err)
+		}
 	}
-	cp := j
-	s.jobs[cp.ID] = &cp
-	out := cp
+	_, err = tx.Exec(`
+		INSERT INTO jobs (id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix)
+		VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+	`, j.ID, j.InputPath, j.OutputPath, j.Profile, boolToInt(j.PreferGPU), j.WorkerID, j.Status, j.CreatedUnix, j.UpdatedUnix)
+	if err != nil {
+		return nil, fmt.Errorf("insert job: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit enqueue: %w", err)
+	}
+	out := j
 	return &out, nil
 }
 
-func (s *Store) pickWorkerLocked(preferGPU bool) string {
+func (s *Store) pickWorkerLocked(preferGPU bool, now int64) (string, error) {
+	rows, err := s.db.Query(`
+		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
+		FROM workers
+	`)
+	if err != nil {
+		return "", fmt.Errorf("list workers for pick: %w", err)
+	}
+	defer rows.Close()
+
 	var bestID string
 	var bestLoad float64 = 1e9
-	for id, w := range s.workers {
-		if w.Status != "online" {
+	for rows.Next() {
+		w, err := scanWorker(rows)
+		if err != nil {
+			return "", err
+		}
+		if statusFor(w.LastHeartbeatUnix, now, s.staleAfterSec) != "online" {
 			continue
 		}
 		if preferGPU && !w.GPU {
@@ -170,42 +318,75 @@ func (s *Store) pickWorkerLocked(preferGPU bool) string {
 			continue
 		}
 		load := float64(w.ActiveJobs) / float64(w.Capacity)
-		// Prefer GPU workers when available even if preferGPU is false (lighter load preference).
+		// Prefer GPU workers when available even if preferGPU is false.
 		if w.GPU {
 			load -= 0.01
 		}
 		if load < bestLoad {
 			bestLoad = load
-			bestID = id
+			bestID = w.ID
 		}
 	}
-	if preferGPU && bestID == "" {
-		// fall back to any online CPU worker
-		return s.pickWorkerLocked(false)
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
-	return bestID
+	if preferGPU && bestID == "" {
+		return s.pickWorkerLocked(false, now)
+	}
+	return bestID, nil
 }
 
 func (s *Store) GetJob(id string) (*Job, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	j, ok := s.jobs[id]
-	if !ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getJobLocked(id)
+}
+
+func (s *Store) getJobLocked(id string) (*Job, error) {
+	var j Job
+	var preferGPU int
+	err := s.db.QueryRow(`
+		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
+		FROM jobs WHERE id = ?
+	`, id).Scan(
+		&j.ID, &j.InputPath, &j.OutputPath, &j.Profile, &preferGPU,
+		&j.WorkerID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
+	)
+	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("job %q not found", id)
 	}
-	cp := *j
-	return &cp, nil
+	if err != nil {
+		return nil, fmt.Errorf("get job: %w", err)
+	}
+	j.PreferGPU = preferGPU != 0
+	return &j, nil
 }
 
 func (s *Store) ListJobs(status string) []*Job {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*Job, 0, len(s.jobs))
-	for _, j := range s.jobs {
-		if status != "" && !strings.EqualFold(j.Status, status) {
-			continue
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
+		FROM jobs
+		WHERE (? = '' OR lower(status) = lower(?))
+		ORDER BY created_unix ASC, id ASC
+	`, status, status)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]*Job, 0)
+	for rows.Next() {
+		var j Job
+		var preferGPU int
+		if err := rows.Scan(
+			&j.ID, &j.InputPath, &j.OutputPath, &j.Profile, &preferGPU,
+			&j.WorkerID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
+		); err != nil {
+			return out
 		}
-		cp := *j
+		j.PreferGPU = preferGPU != 0
+		cp := j
 		out = append(out, &cp)
 	}
 	return out
@@ -214,19 +395,145 @@ func (s *Store) ListJobs(status string) []*Job {
 func (s *Store) CancelJob(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, ok := s.jobs[id]
-	if !ok {
-		return fmt.Errorf("job %q not found", id)
+	j, err := s.getJobLocked(id)
+	if err != nil {
+		return err
 	}
 	if j.Status == "done" || j.Status == "cancelled" {
 		return nil
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	if j.WorkerID != "" {
-		if w, ok := s.workers[j.WorkerID]; ok && w.ActiveJobs > 0 {
-			w.ActiveJobs--
+		if _, err := tx.Exec(`
+			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
+			WHERE id = ?
+		`, j.WorkerID); err != nil {
+			return fmt.Errorf("release worker load: %w", err)
 		}
 	}
-	j.Status = "cancelled"
-	j.UpdatedUnix = time.Now().Unix()
-	return nil
+	if _, err := tx.Exec(`UPDATE jobs SET status = 'cancelled', updated_unix = ? WHERE id = ?`, time.Now().Unix(), id); err != nil {
+		return fmt.Errorf("cancel job: %w", err)
+	}
+	return tx.Commit()
+}
+
+// GetWorker returns a worker by id (status refreshed from heartbeat age).
+func (s *Store) GetWorker(id string) (*Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getWorkerLocked(id, time.Now().Unix())
+}
+
+// MarkJobRunning transitions assigned → running.
+func (s *Store) MarkJobRunning(id string) error {
+	return s.setJobStatus(id, "running", "", false)
+}
+
+// MarkJobDone transitions a job to done and releases worker capacity.
+func (s *Store) MarkJobDone(id string) error {
+	return s.setJobStatus(id, "done", "", true)
+}
+
+// MarkJobFailed transitions a job to failed and releases worker capacity.
+func (s *Store) MarkJobFailed(id, errMsg string) error {
+	return s.setJobStatus(id, "failed", errMsg, true)
+}
+
+func (s *Store) setJobStatus(id, status, errMsg string, releaseWorker bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, err := s.getJobLocked(id)
+	if err != nil {
+		return err
+	}
+	if j.Status == "done" || j.Status == "cancelled" || j.Status == "failed" {
+		if j.Status == status {
+			return nil
+		}
+		return fmt.Errorf("job %q already terminal (%s)", id, j.Status)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if releaseWorker && j.WorkerID != "" {
+		if _, err := tx.Exec(`
+			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
+			WHERE id = ?
+		`, j.WorkerID); err != nil {
+			return fmt.Errorf("release worker load: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`
+		UPDATE jobs SET status = ?, error = ?, updated_unix = ? WHERE id = ?
+	`, status, errMsg, time.Now().Unix(), id); err != nil {
+		return fmt.Errorf("update job status: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) getWorkerLocked(id string, now int64) (*Worker, error) {
+	row := s.db.QueryRow(`
+		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
+		FROM workers WHERE id = ?
+	`, id)
+	w, err := scanWorker(row)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("worker %q not found", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.Status = statusFor(w.LastHeartbeatUnix, now, s.staleAfterSec)
+	return w, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanWorker(row rowScanner) (*Worker, error) {
+	var w Worker
+	var gpu int
+	var labelsJSON string
+	if err := row.Scan(
+		&w.ID, &w.NodeID, &w.GRPCAddr, &gpu, &w.Capacity, &w.ActiveJobs,
+		&labelsJSON, &w.LastHeartbeatUnix, &w.Status,
+	); err != nil {
+		return nil, err
+	}
+	w.GPU = gpu != 0
+	if labelsJSON == "" {
+		w.Labels = []string{}
+	} else if err := json.Unmarshal([]byte(labelsJSON), &w.Labels); err != nil {
+		return nil, fmt.Errorf("unmarshal labels: %w", err)
+	}
+	if w.Labels == nil {
+		w.Labels = []string{}
+	}
+	return &w, nil
+}
+
+func statusFor(lastHeartbeat, now, staleAfterSec int64) string {
+	age := now - lastHeartbeat
+	switch {
+	case age > staleAfterSec*2:
+		return "offline"
+	case age > staleAfterSec:
+		return "stale"
+	default:
+		return "online"
+	}
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }

@@ -1,13 +1,30 @@
 package internal_test
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/Muxcore-Media/media-transcoder-pool/internal"
+	poolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 )
 
+func openTempStore(t *testing.T) *internal.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pool.db")
+	s, err := internal.OpenStore(path, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 func TestAssignPrefersGPU(t *testing.T) {
-	s := internal.NewStore(60)
+	s := openTempStore(t)
 	cpu, err := s.RegisterWorker(internal.Worker{NodeID: "n1", GRPCAddr: ":9525", Capacity: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -32,13 +49,19 @@ func TestAssignPrefersGPU(t *testing.T) {
 }
 
 func TestQueueWhenNoCapacity(t *testing.T) {
-	s := internal.NewStore(60)
+	s := openTempStore(t)
 	_, err := s.RegisterWorker(internal.Worker{GRPCAddr: ":1", Capacity: 1, ActiveJobs: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	j1, _ := s.Enqueue(internal.Job{InputPath: "a", OutputPath: "b"})
-	j2, _ := s.Enqueue(internal.Job{InputPath: "c", OutputPath: "d"})
+	j1, err := s.Enqueue(internal.Job{InputPath: "a", OutputPath: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, err := s.Enqueue(internal.Job{InputPath: "c", OutputPath: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if j1.Status != "assigned" {
 		t.Fatalf("j1=%+v", j1)
 	}
@@ -47,5 +70,129 @@ func TestQueueWhenNoCapacity(t *testing.T) {
 	}
 	if err := s.CancelJob(j1.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDurableJobQueueSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool.db")
+	s1, err := internal.OpenStore(path, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := s1.RegisterWorker(internal.Worker{
+		ID: "tw_cpu1", NodeID: "node-a", GRPCAddr: "127.0.0.1:19001", Capacity: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s1.Enqueue(internal.Job{
+		InputPath: "/media/in.mkv", OutputPath: "/media/out.mkv", Profile: "h264_fast",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "assigned" || job.WorkerID != w.ID {
+		t.Fatalf("expected assigned to %s, got %+v", w.ID, job)
+	}
+	jobID := job.ID
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := internal.OpenStore(path, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	got, err := s2.GetJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "assigned" || got.WorkerID != w.ID || got.InputPath != "/media/in.mkv" {
+		t.Fatalf("job not durable: %+v", got)
+	}
+	workers := s2.ListWorkers(false)
+	if len(workers) != 1 || workers[0].ID != w.ID || workers[0].ActiveJobs != 1 {
+		t.Fatalf("workers not durable: %+v", workers)
+	}
+	queued := s2.ListJobs("assigned")
+	if len(queued) != 1 || queued[0].ID != jobID {
+		t.Fatalf("list jobs: %+v", queued)
+	}
+}
+
+func TestFakeWorkerRegisterHeartbeatEnqueue(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "pool.db")
+	m := internal.NewModule(internal.Config{
+		DBPath:   dbPath,
+		GRPCAddr: "127.0.0.1:0",
+		HTTPAddr: "127.0.0.1:0",
+	})
+	if err := m.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(ctx) })
+
+	conn, err := grpc.NewClient(m.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	client := poolv1.NewTranscoderPoolServiceClient(conn)
+
+	// Fake CPU worker — no GPU farm.
+	reg, err := client.RegisterWorker(ctx, &poolv1.RegisterWorkerRequest{
+		Id:       "fake-cpu-1",
+		NodeId:   "laptop",
+		GrpcAddr: "127.0.0.1:19999",
+		Gpu:      false,
+		Capacity: 2,
+		Labels:   []string{"cpu", "fake"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterWorker: %v", err)
+	}
+	if reg.Worker.GetId() != "fake-cpu-1" || reg.Worker.GetGpu() || reg.Worker.GetStatus() != "online" {
+		t.Fatalf("unexpected worker: %+v", reg.Worker)
+	}
+
+	hb, err := client.Heartbeat(ctx, &poolv1.HeartbeatRequest{Id: "fake-cpu-1", ActiveJobs: 0})
+	if err != nil || !hb.GetOk() {
+		t.Fatalf("Heartbeat: ok=%v err=%v", hb.GetOk(), err)
+	}
+
+	enq, err := client.Enqueue(ctx, &poolv1.EnqueueRequest{
+		InputPath:  "/fixtures/clip.mkv",
+		OutputPath: "/tmp/clip.mp4",
+		Profile:    "h264_fast",
+		PreferGpu:  false,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	job := enq.GetJob()
+	if job.GetStatus() != "assigned" || job.GetWorkerId() != "fake-cpu-1" {
+		t.Fatalf("expected assigned to fake-cpu-1, got %+v", job)
+	}
+
+	got, err := client.GetJob(ctx, &poolv1.GetJobRequest{Id: job.GetId()})
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.Job.GetWorkerId() != "fake-cpu-1" {
+		t.Fatalf("GetJob: %+v", got.Job)
+	}
+
+	workers, err := client.ListWorkers(ctx, &poolv1.ListWorkersRequest{GpuOnly: false})
+	if err != nil {
+		t.Fatalf("ListWorkers: %v", err)
+	}
+	if len(workers.Workers) != 1 || workers.Workers[0].GetActiveJobs() != 1 {
+		t.Fatalf("workers=%+v", workers.Workers)
 	}
 }
