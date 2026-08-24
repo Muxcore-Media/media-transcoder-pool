@@ -1,0 +1,106 @@
+# MuxCore golangci-lint configuration
+# Run: golangci-lint run ./internal/... ./pkg/... ./cmd/...
+
+version: "2"
+
+linters:
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - prealloc
+    - gosec
+    - bodyclose
+    - noctx
+    - errorlint
+    - forcetypeassert
+    - whitespace
+    - gocyclo
+    - bidichk
+    - containedctx
+    - contextcheck
+    - depguard
+    - errcheck
+    - gocheckcompilerdirectives
+    - gocritic
+    - gomoddirectives
+    - nilerr
+    - nolintlint
+    - nosprintfhostport
+    - predeclared
+    - spancheck
+  default: none
+  settings:
+    gomoddirectives:
+      replace-local: true
+    govet:
+      enable:
+        - fieldalignment
+        - shadow
+        - nilness
+        - lostcancel
+        - sigchanyzer
+        - sortslice
+        - unusedwrite
+    gosec:
+      excludes:
+        - G104
+    gocyclo:
+      min-complexity: 30
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: "^log$"
+              desc: "use log/slog instead of log"
+            - pkg: "^io/ioutil$"
+              desc: "use os or io instead of io/ioutil (deprecated)"
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+        - opinionated
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+        - unnamedResult
+        - hugeParam
+        - rangeValCopy
+        - exitAfterDefer
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    paths:
+      - '.*_test\.go'
+    rules:
+      - path: '.*_test\.go'
+        linters:
+          - gosec
+      - linters:
+          - noctx
+        source: '//nolint'
+      - linters:
+          - errcheck
+          - contextcheck
+        path: '.*_test\.go'
+      # Allow context.Background() in specific known-safe patterns
+      - linters:
+          - contextcheck
+        source: 'context\.Background\(\)'
+      # Allow nolintlint to skip deprecated pkg nolints during migration
+      - linters:
+          - nolintlint
+        source: '//nolint:gosec'
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+run:
+  timeout: 5m

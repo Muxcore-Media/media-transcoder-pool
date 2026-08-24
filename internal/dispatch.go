@@ -71,13 +71,12 @@ func (s *grpcTranscoderSession) Close() error {
 
 // Dispatcher forwards assigned pool jobs to worker TranscodeService endpoints.
 type Dispatcher struct {
-	store  *Store
-	dialer TranscoderDialer
-	poll   time.Duration
-	wait   time.Duration
-
-	mu       sync.Mutex
+	store    *Store
+	dialer   TranscoderDialer
 	inflight map[string]struct{}
+	poll     time.Duration
+	wait     time.Duration
+	mu       sync.Mutex
 }
 
 // NewDispatcher creates a dispatcher. Defaults: poll 200ms, wait poll 250ms.
@@ -110,7 +109,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 
 // Tick processes each currently assigned job once (idempotent via inflight set).
 func (d *Dispatcher) Tick(ctx context.Context) {
-	for _, j := range d.store.ListJobs("assigned") {
+	for _, j := range d.store.ListJobs(ctx, "assigned") {
 		d.mu.Lock()
 		_, busy := d.inflight[j.ID]
 		if !busy {
@@ -136,24 +135,24 @@ func (d *Dispatcher) Tick(ctx context.Context) {
 
 func (d *Dispatcher) dispatchOne(ctx context.Context, job *Job) error {
 	if job.WorkerID == "" {
-		return d.store.MarkJobFailed(job.ID, "no worker assigned")
+		return d.store.MarkJobFailed(ctx, job.ID, "no worker assigned")
 	}
-	w, err := d.store.GetWorker(job.WorkerID)
+	w, err := d.store.GetWorker(ctx, job.WorkerID)
 	if err != nil {
-		return d.store.MarkJobFailed(job.ID, err.Error())
+		return d.store.MarkJobFailed(ctx, job.ID, err.Error())
 	}
 	sess, err := d.dialer(ctx, w.GRPCAddr)
 	if err != nil {
-		return d.store.MarkJobFailed(job.ID, err.Error())
+		return d.store.MarkJobFailed(ctx, job.ID, err.Error())
 	}
 	defer func() { _ = sess.Close() }()
 
-	if err := d.store.MarkJobRunning(job.ID); err != nil {
-		return err
+	if markErr := d.store.MarkJobRunning(ctx, job.ID); markErr != nil {
+		return markErr
 	}
 	remoteID, err := sess.Enqueue(ctx, job.InputPath, job.OutputPath, job.Profile)
 	if err != nil {
-		return d.store.MarkJobFailed(job.ID, err.Error())
+		return d.store.MarkJobFailed(ctx, job.ID, err.Error())
 	}
 
 	deadline := time.Now().Add(2 * time.Minute)
@@ -165,17 +164,17 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, job *Job) error {
 		}
 		status, errMsg, err := sess.GetJob(ctx, remoteID)
 		if err != nil {
-			return d.store.MarkJobFailed(job.ID, err.Error())
+			return d.store.MarkJobFailed(ctx, job.ID, err.Error())
 		}
 		switch status {
 		case "completed", "done":
-			return d.store.MarkJobDone(job.ID)
+			return d.store.MarkJobDone(ctx, job.ID)
 		case "failed", "cancelled":
 			if errMsg == "" {
 				errMsg = status
 			}
-			return d.store.MarkJobFailed(job.ID, errMsg)
+			return d.store.MarkJobFailed(ctx, job.ID, errMsg)
 		}
 	}
-	return d.store.MarkJobFailed(job.ID, "worker job timed out")
+	return d.store.MarkJobFailed(ctx, job.ID, "worker job timed out")
 }
