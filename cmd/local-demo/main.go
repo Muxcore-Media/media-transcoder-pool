@@ -53,7 +53,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	m := internal.NewModule(internal.Config{
 		DBPath:   filepath.Join(dir, "pool.db"),
@@ -61,29 +61,29 @@ func run() error {
 		HTTPAddr: "127.0.0.1:0",
 		Dispatch: true,
 	})
-	if err := m.Init(ctx); err != nil {
-		return err
+	if initErr := m.Init(ctx); initErr != nil {
+		return initErr
 	}
-	if err := m.Start(ctx); err != nil {
-		return err
+	if startErr := m.Start(ctx); startErr != nil {
+		return startErr
 	}
-	defer m.Stop(context.Background())
+	defer func() { _ = m.Stop(context.Background()) }()
 
 	conn, err := grpc.NewClient(m.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	client := poolv1.NewTranscoderPoolServiceClient(conn)
 
-	if _, err := client.RegisterWorker(ctx, &poolv1.RegisterWorkerRequest{
+	if _, regErr := client.RegisterWorker(ctx, &poolv1.RegisterWorkerRequest{
 		Id: "demo-worker-1", NodeId: "laptop", GrpcAddr: workerAddr,
 		Gpu: false, Capacity: 1, Labels: []string{"cpu", "local-demo"},
-	}); err != nil {
-		return fmt.Errorf("register: %w", err)
+	}); regErr != nil {
+		return fmt.Errorf("register: %w", regErr)
 	}
-	if _, err := client.Heartbeat(ctx, &poolv1.HeartbeatRequest{Id: "demo-worker-1"}); err != nil {
-		return fmt.Errorf("heartbeat: %w", err)
+	if _, hbErr := client.Heartbeat(ctx, &poolv1.HeartbeatRequest{Id: "demo-worker-1"}); hbErr != nil {
+		return fmt.Errorf("heartbeat: %w", hbErr)
 	}
 
 	enq, err := client.Enqueue(ctx, &poolv1.EnqueueRequest{

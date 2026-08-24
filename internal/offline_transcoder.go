@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Muxcore-Media/media-transcoder-pool/internal/transcodev1"
 )
@@ -17,21 +18,19 @@ import (
 // It speaks the same TranscodeService RPCs the pool dispatcher dials.
 type OfflineTranscoder struct {
 	transcodev1.UnimplementedTranscodeServiceServer
-
-	mu     sync.Mutex
-	jobs   map[string]*transcodev1.TranscodeJob
-	nextID atomic.Int64
-	lis    net.Listener
-	srv    *grpc.Server
-	addr   string
-
-	// CompleteAfter delays before marking jobs completed (0 = immediate on GetJob).
+	lis           net.Listener
+	jobs          map[string]*transcodev1.TranscodeJob
+	srv           *grpc.Server
+	addr          string
+	nextID        atomic.Int64
 	CompleteAfter time.Duration
+	mu            sync.Mutex
 }
 
 // StartOfflineTranscoder listens on addr (use "127.0.0.1:0" for an ephemeral port).
 func StartOfflineTranscoder(addr string) (*OfflineTranscoder, error) {
-	lis, err := net.Listen("tcp", addr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -95,8 +94,11 @@ func (t *OfflineTranscoder) GetJob(_ context.Context, req *transcodev1.GetJobReq
 	if !ok {
 		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
 	}
-	cp := *j
-	return &transcodev1.GetJobResponse{Job: &cp}, nil
+	cloned, ok := proto.Clone(j).(*transcodev1.TranscodeJob)
+	if !ok {
+		return nil, fmt.Errorf("clone job failed")
+	}
+	return &transcodev1.GetJobResponse{Job: cloned}, nil
 }
 
 func (t *OfflineTranscoder) ListProfiles(context.Context, *transcodev1.ListProfilesRequest) (*transcodev1.ListProfilesResponse, error) {

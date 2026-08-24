@@ -1,8 +1,10 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,12 +20,12 @@ type Worker struct {
 	ID                string
 	NodeID            string
 	GRPCAddr          string
-	GPU               bool
-	Capacity          int32
-	ActiveJobs        int32
+	Status            string
 	Labels            []string
 	LastHeartbeatUnix int64
-	Status            string
+	Capacity          int32
+	ActiveJobs        int32
+	GPU               bool
 }
 
 type Job struct {
@@ -31,24 +33,24 @@ type Job struct {
 	InputPath   string
 	OutputPath  string
 	Profile     string
-	PreferGPU   bool
 	WorkerID    string
 	Status      string
 	Error       string
 	CreatedUnix int64
 	UpdatedUnix int64
+	PreferGPU   bool
 }
 
 // Store is a durable SQLite-backed worker registry and job queue.
 type Store struct {
-	mu            sync.Mutex
 	db            *sql.DB
 	path          string
 	staleAfterSec int64
+	mu            sync.Mutex
 }
 
 // OpenStore opens or creates a SQLite database at path (WAL mode).
-func OpenStore(path string, staleAfterSec int64) (*Store, error) {
+func OpenStore(ctx context.Context, path string, staleAfterSec int64) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("db path required")
 	}
@@ -63,20 +65,20 @@ func OpenStore(path string, staleAfterSec int64) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("enable WAL: %w", err)
 	}
 	s := &Store{db: db, path: path, staleAfterSec: staleAfterSec}
-	if err := s.migrate(); err != nil {
+	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+func (s *Store) migrate(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS workers (
 			id TEXT PRIMARY KEY,
 			node_id TEXT NOT NULL DEFAULT '',
@@ -135,7 +137,7 @@ func (s *Store) SetStaleAfterSec(n int64) {
 	s.staleAfterSec = n
 }
 
-func (s *Store) RegisterWorker(w Worker) (*Worker, error) {
+func (s *Store) RegisterWorker(ctx context.Context, w Worker) (*Worker, error) {
 	if strings.TrimSpace(w.GRPCAddr) == "" {
 		return nil, fmt.Errorf("grpc_addr required")
 	}
@@ -151,13 +153,11 @@ func (s *Store) RegisterWorker(w Worker) (*Worker, error) {
 		w.Labels = []string{}
 	}
 	now := time.Now().Unix()
-	w.LastHeartbeatUnix = now
-	w.Status = "online"
 	labels, err := json.Marshal(w.Labels)
 	if err != nil {
 		return nil, fmt.Errorf("marshal labels: %w", err)
 	}
-	_, err = s.db.Exec(`
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO workers (id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status)
 		VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'online')
 		ON CONFLICT(id) DO UPDATE SET
@@ -172,17 +172,17 @@ func (s *Store) RegisterWorker(w Worker) (*Worker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("upsert worker: %w", err)
 	}
-	out, err := s.getWorkerLocked(w.ID, now)
+	out, err := s.getWorkerLocked(ctx, w.ID, now)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (s *Store) Heartbeat(id string, active int32) error {
+func (s *Store) Heartbeat(ctx context.Context, id string, active int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE workers SET active_jobs = ?, last_heartbeat_unix = ?, status = 'online' WHERE id = ?
 	`, active, time.Now().Unix(), id)
 	if err != nil {
@@ -198,10 +198,10 @@ func (s *Store) Heartbeat(id string, active int32) error {
 	return nil
 }
 
-func (s *Store) UnregisterWorker(id string) error {
+func (s *Store) UnregisterWorker(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`DELETE FROM workers WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM workers WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("unregister: %w", err)
 	}
@@ -215,18 +215,18 @@ func (s *Store) UnregisterWorker(id string) error {
 	return nil
 }
 
-func (s *Store) ListWorkers(gpuOnly bool) []*Worker {
+func (s *Store) ListWorkers(ctx context.Context, gpuOnly bool) []*Worker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
 		FROM workers ORDER BY id
 	`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Worker, 0)
 	for rows.Next() {
 		w, err := scanWorker(rows)
@@ -242,7 +242,7 @@ func (s *Store) ListWorkers(gpuOnly bool) []*Worker {
 	return out
 }
 
-func (s *Store) Enqueue(j Job) (*Job, error) {
+func (s *Store) Enqueue(ctx context.Context, j Job) (*Job, error) {
 	if strings.TrimSpace(j.InputPath) == "" || strings.TrimSpace(j.OutputPath) == "" {
 		return nil, fmt.Errorf("input_path and output_path required")
 	}
@@ -260,11 +260,11 @@ func (s *Store) Enqueue(j Job) (*Job, error) {
 	j.Status = "queued"
 	j.WorkerID = ""
 
-	workerID, err := s.pickWorkerLocked(j.PreferGPU, now)
+	workerID, err := s.pickWorkerLocked(ctx, j.PreferGPU, now)
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
@@ -273,11 +273,11 @@ func (s *Store) Enqueue(j Job) (*Job, error) {
 	if workerID != "" {
 		j.WorkerID = workerID
 		j.Status = "assigned"
-		if _, err := tx.Exec(`UPDATE workers SET active_jobs = active_jobs + 1 WHERE id = ?`, workerID); err != nil {
-			return nil, fmt.Errorf("bump worker load: %w", err)
+		if _, bumpErr := tx.ExecContext(ctx, `UPDATE workers SET active_jobs = active_jobs + 1 WHERE id = ?`, workerID); bumpErr != nil {
+			return nil, fmt.Errorf("bump worker load: %w", bumpErr)
 		}
 	}
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO jobs (id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix)
 		VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
 	`, j.ID, j.InputPath, j.OutputPath, j.Profile, boolToInt(j.PreferGPU), j.WorkerID, j.Status, j.CreatedUnix, j.UpdatedUnix)
@@ -291,18 +291,18 @@ func (s *Store) Enqueue(j Job) (*Job, error) {
 	return &out, nil
 }
 
-func (s *Store) pickWorkerLocked(preferGPU bool, now int64) (string, error) {
-	rows, err := s.db.Query(`
+func (s *Store) pickWorkerLocked(ctx context.Context, preferGPU bool, now int64) (string, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
 		FROM workers
 	`)
 	if err != nil {
 		return "", fmt.Errorf("list workers for pick: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bestID string
-	var bestLoad float64 = 1e9
+	var bestLoad = 1e9
 	for rows.Next() {
 		w, err := scanWorker(rows)
 		if err != nil {
@@ -331,28 +331,28 @@ func (s *Store) pickWorkerLocked(preferGPU bool, now int64) (string, error) {
 		return "", err
 	}
 	if preferGPU && bestID == "" {
-		return s.pickWorkerLocked(false, now)
+		return s.pickWorkerLocked(ctx, false, now)
 	}
 	return bestID, nil
 }
 
-func (s *Store) GetJob(id string) (*Job, error) {
+func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.getJobLocked(id)
+	return s.getJobLocked(ctx, id)
 }
 
-func (s *Store) getJobLocked(id string) (*Job, error) {
+func (s *Store) getJobLocked(ctx context.Context, id string) (*Job, error) {
 	var j Job
 	var preferGPU int
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
 		FROM jobs WHERE id = ?
 	`, id).Scan(
 		&j.ID, &j.InputPath, &j.OutputPath, &j.Profile, &preferGPU,
 		&j.WorkerID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("job %q not found", id)
 	}
 	if err != nil {
@@ -362,10 +362,10 @@ func (s *Store) getJobLocked(id string) (*Job, error) {
 	return &j, nil
 }
 
-func (s *Store) ListJobs(status string) []*Job {
+func (s *Store) ListJobs(ctx context.Context, status string) []*Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
 		FROM jobs
 		WHERE (? = '' OR lower(status) = lower(?))
@@ -374,7 +374,7 @@ func (s *Store) ListJobs(status string) []*Job {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Job, 0)
 	for rows.Next() {
 		var j Job
@@ -392,61 +392,61 @@ func (s *Store) ListJobs(status string) []*Job {
 	return out
 }
 
-func (s *Store) CancelJob(id string) error {
+func (s *Store) CancelJob(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, err := s.getJobLocked(id)
+	j, err := s.getJobLocked(ctx, id)
 	if err != nil {
 		return err
 	}
 	if j.Status == "done" || j.Status == "cancelled" {
 		return nil
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	if j.WorkerID != "" {
-		if _, err := tx.Exec(`
+		if _, relErr := tx.ExecContext(ctx, `
 			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
 			WHERE id = ?
-		`, j.WorkerID); err != nil {
-			return fmt.Errorf("release worker load: %w", err)
+		`, j.WorkerID); relErr != nil {
+			return fmt.Errorf("release worker load: %w", relErr)
 		}
 	}
-	if _, err := tx.Exec(`UPDATE jobs SET status = 'cancelled', updated_unix = ? WHERE id = ?`, time.Now().Unix(), id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET status = 'cancelled', updated_unix = ? WHERE id = ?`, time.Now().Unix(), id); err != nil {
 		return fmt.Errorf("cancel job: %w", err)
 	}
 	return tx.Commit()
 }
 
 // GetWorker returns a worker by id (status refreshed from heartbeat age).
-func (s *Store) GetWorker(id string) (*Worker, error) {
+func (s *Store) GetWorker(ctx context.Context, id string) (*Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.getWorkerLocked(id, time.Now().Unix())
+	return s.getWorkerLocked(ctx, id, time.Now().Unix())
 }
 
 // MarkJobRunning transitions assigned → running.
-func (s *Store) MarkJobRunning(id string) error {
-	return s.setJobStatus(id, "running", "", false)
+func (s *Store) MarkJobRunning(ctx context.Context, id string) error {
+	return s.setJobStatus(ctx, id, "running", "", false)
 }
 
 // MarkJobDone transitions a job to done and releases worker capacity.
-func (s *Store) MarkJobDone(id string) error {
-	return s.setJobStatus(id, "done", "", true)
+func (s *Store) MarkJobDone(ctx context.Context, id string) error {
+	return s.setJobStatus(ctx, id, "done", "", true)
 }
 
 // MarkJobFailed transitions a job to failed and releases worker capacity.
-func (s *Store) MarkJobFailed(id, errMsg string) error {
-	return s.setJobStatus(id, "failed", errMsg, true)
+func (s *Store) MarkJobFailed(ctx context.Context, id, errMsg string) error {
+	return s.setJobStatus(ctx, id, "failed", errMsg, true)
 }
 
-func (s *Store) setJobStatus(id, status, errMsg string, releaseWorker bool) error {
+func (s *Store) setJobStatus(ctx context.Context, id, status, errMsg string, releaseWorker bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, err := s.getJobLocked(id)
+	j, err := s.getJobLocked(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -456,20 +456,20 @@ func (s *Store) setJobStatus(id, status, errMsg string, releaseWorker bool) erro
 		}
 		return fmt.Errorf("job %q already terminal (%s)", id, j.Status)
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	if releaseWorker && j.WorkerID != "" {
-		if _, err := tx.Exec(`
+		if _, relErr := tx.ExecContext(ctx, `
 			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
 			WHERE id = ?
-		`, j.WorkerID); err != nil {
-			return fmt.Errorf("release worker load: %w", err)
+		`, j.WorkerID); relErr != nil {
+			return fmt.Errorf("release worker load: %w", relErr)
 		}
 	}
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET status = ?, error = ?, updated_unix = ? WHERE id = ?
 	`, status, errMsg, time.Now().Unix(), id); err != nil {
 		return fmt.Errorf("update job status: %w", err)
@@ -477,13 +477,13 @@ func (s *Store) setJobStatus(id, status, errMsg string, releaseWorker bool) erro
 	return tx.Commit()
 }
 
-func (s *Store) getWorkerLocked(id string, now int64) (*Worker, error) {
-	row := s.db.QueryRow(`
+func (s *Store) getWorkerLocked(ctx context.Context, id string, now int64) (*Worker, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
 		FROM workers WHERE id = ?
 	`, id)
 	w, err := scanWorker(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("worker %q not found", id)
 	}
 	if err != nil {

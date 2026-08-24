@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -19,15 +20,18 @@ import (
 )
 
 type Module struct {
-	id, grpcAddr, httpAddr, dbPath string
-	staleAfterSec                  int64
-	dispatch                       bool
-	cfgMu                          sync.RWMutex
-	store                          *Store
-	grpcSrv                        *grpc.Server
-	lis                            net.Listener
-	httpSrv                        *http.Server
-	dispCancel                     context.CancelFunc
+	lis           net.Listener
+	store         *Store
+	grpcSrv       *grpc.Server
+	httpSrv       *http.Server
+	dispCancel    context.CancelFunc
+	id            string
+	grpcAddr      string
+	httpAddr      string
+	dbPath        string
+	staleAfterSec int64
+	cfgMu         sync.RWMutex
+	dispatch      bool
 }
 
 type Config struct {
@@ -83,7 +87,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 }
 
 func (m *Module) Init(ctx context.Context) error {
-	store, err := OpenStore(m.dbPath, m.staleAfterSec)
+	store, err := OpenStore(ctx, m.dbPath, m.staleAfterSec)
 	if err != nil {
 		return err
 	}
@@ -96,7 +100,8 @@ func (m *Module) Start(ctx context.Context) error {
 	if m.store == nil {
 		return fmt.Errorf("store not initialized")
 	}
-	lis, err := net.Listen("tcp", m.grpcAddr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("listen gRPC %s: %w", m.grpcAddr, err)
 	}
@@ -107,8 +112,8 @@ func (m *Module) Start(ctx context.Context) error {
 	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
 	go func() {
 		slog.Info("transcoder-pool gRPC listening", "addr", m.grpcAddr)
-		if err := m.grpcSrv.Serve(lis); err != nil {
-			slog.Error("gRPC serve", "error", err)
+		if serveErr := m.grpcSrv.Serve(lis); serveErr != nil {
+			slog.Error("gRPC serve", "error", serveErr)
 		}
 	}()
 	mux := http.NewServeMux()
@@ -116,23 +121,28 @@ func (m *Module) Start(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	httpLis, err := net.Listen("tcp", m.httpAddr)
+	httpLis, err := lc.Listen(ctx, "tcp", m.httpAddr)
 	if err != nil {
 		m.grpcSrv.GracefulStop()
 		return fmt.Errorf("listen HTTP %s: %w", m.httpAddr, err)
 	}
 	m.httpAddr = httpLis.Addr().String()
-	m.httpSrv = &http.Server{Handler: mux}
+	m.httpSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
-			slog.Error("health serve", "error", err)
+		if serveErr := m.httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
+			slog.Error("health serve", "error", serveErr)
 		}
 	}()
 	if m.dispatch {
-		dctx, cancel := context.WithCancel(context.Background())
+		dctx, cancel := context.WithCancel(ctx)
 		m.dispCancel = cancel
-		go NewDispatcher(m.store, GRPCTranscoderDialer).Run(dctx)
+		go func() {
+			NewDispatcher(m.store, GRPCTranscoderDialer).Run(dctx)
+		}()
 		slog.Info("transcoder-pool dispatcher enabled")
 	}
 	return nil
@@ -169,8 +179,8 @@ type poolServer struct {
 	m *Module
 }
 
-func (s *poolServer) RegisterWorker(_ context.Context, req *poolv1.RegisterWorkerRequest) (*poolv1.RegisterWorkerResponse, error) {
-	w, err := s.m.store.RegisterWorker(Worker{
+func (s *poolServer) RegisterWorker(ctx context.Context, req *poolv1.RegisterWorkerRequest) (*poolv1.RegisterWorkerResponse, error) {
+	w, err := s.m.store.RegisterWorker(ctx, Worker{
 		ID: req.GetId(), NodeID: req.GetNodeId(), GRPCAddr: req.GetGrpcAddr(),
 		GPU: req.GetGpu(), Capacity: req.GetCapacity(), Labels: req.GetLabels(),
 	})
@@ -180,22 +190,22 @@ func (s *poolServer) RegisterWorker(_ context.Context, req *poolv1.RegisterWorke
 	return &poolv1.RegisterWorkerResponse{Worker: toPBWorker(w)}, nil
 }
 
-func (s *poolServer) Heartbeat(_ context.Context, req *poolv1.HeartbeatRequest) (*poolv1.HeartbeatResponse, error) {
-	if err := s.m.store.Heartbeat(req.GetId(), req.GetActiveJobs()); err != nil {
+func (s *poolServer) Heartbeat(ctx context.Context, req *poolv1.HeartbeatRequest) (*poolv1.HeartbeatResponse, error) {
+	if err := s.m.store.Heartbeat(ctx, req.GetId(), req.GetActiveJobs()); err != nil {
 		return nil, err
 	}
 	return &poolv1.HeartbeatResponse{Ok: true}, nil
 }
 
-func (s *poolServer) UnregisterWorker(_ context.Context, req *poolv1.UnregisterWorkerRequest) (*poolv1.UnregisterWorkerResponse, error) {
-	if err := s.m.store.UnregisterWorker(req.GetId()); err != nil {
+func (s *poolServer) UnregisterWorker(ctx context.Context, req *poolv1.UnregisterWorkerRequest) (*poolv1.UnregisterWorkerResponse, error) {
+	if err := s.m.store.UnregisterWorker(ctx, req.GetId()); err != nil {
 		return nil, err
 	}
 	return &poolv1.UnregisterWorkerResponse{Success: true}, nil
 }
 
-func (s *poolServer) ListWorkers(_ context.Context, req *poolv1.ListWorkersRequest) (*poolv1.ListWorkersResponse, error) {
-	items := s.m.store.ListWorkers(req.GetGpuOnly())
+func (s *poolServer) ListWorkers(ctx context.Context, req *poolv1.ListWorkersRequest) (*poolv1.ListWorkersResponse, error) {
+	items := s.m.store.ListWorkers(ctx, req.GetGpuOnly())
 	out := make([]*poolv1.Worker, 0, len(items))
 	for _, w := range items {
 		out = append(out, toPBWorker(w))
@@ -203,8 +213,8 @@ func (s *poolServer) ListWorkers(_ context.Context, req *poolv1.ListWorkersReque
 	return &poolv1.ListWorkersResponse{Workers: out}, nil
 }
 
-func (s *poolServer) Enqueue(_ context.Context, req *poolv1.EnqueueRequest) (*poolv1.EnqueueResponse, error) {
-	j, err := s.m.store.Enqueue(Job{
+func (s *poolServer) Enqueue(ctx context.Context, req *poolv1.EnqueueRequest) (*poolv1.EnqueueResponse, error) {
+	j, err := s.m.store.Enqueue(ctx, Job{
 		InputPath: req.GetInputPath(), OutputPath: req.GetOutputPath(),
 		Profile: req.GetProfile(), PreferGPU: req.GetPreferGpu(),
 	})
@@ -214,16 +224,16 @@ func (s *poolServer) Enqueue(_ context.Context, req *poolv1.EnqueueRequest) (*po
 	return &poolv1.EnqueueResponse{Job: toPBJob(j)}, nil
 }
 
-func (s *poolServer) GetJob(_ context.Context, req *poolv1.GetJobRequest) (*poolv1.GetJobResponse, error) {
-	j, err := s.m.store.GetJob(req.GetId())
+func (s *poolServer) GetJob(ctx context.Context, req *poolv1.GetJobRequest) (*poolv1.GetJobResponse, error) {
+	j, err := s.m.store.GetJob(ctx, req.GetId())
 	if err != nil {
 		return nil, err
 	}
 	return &poolv1.GetJobResponse{Job: toPBJob(j)}, nil
 }
 
-func (s *poolServer) ListJobs(_ context.Context, req *poolv1.ListJobsRequest) (*poolv1.ListJobsResponse, error) {
-	items := s.m.store.ListJobs(req.GetStatus())
+func (s *poolServer) ListJobs(ctx context.Context, req *poolv1.ListJobsRequest) (*poolv1.ListJobsResponse, error) {
+	items := s.m.store.ListJobs(ctx, req.GetStatus())
 	out := make([]*poolv1.Job, 0, len(items))
 	for _, j := range items {
 		out = append(out, toPBJob(j))
@@ -231,8 +241,8 @@ func (s *poolServer) ListJobs(_ context.Context, req *poolv1.ListJobsRequest) (*
 	return &poolv1.ListJobsResponse{Jobs: out}, nil
 }
 
-func (s *poolServer) CancelJob(_ context.Context, req *poolv1.CancelJobRequest) (*poolv1.CancelJobResponse, error) {
-	if err := s.m.store.CancelJob(req.GetId()); err != nil {
+func (s *poolServer) CancelJob(ctx context.Context, req *poolv1.CancelJobRequest) (*poolv1.CancelJobResponse, error) {
+	if err := s.m.store.CancelJob(ctx, req.GetId()); err != nil {
 		return nil, err
 	}
 	return &poolv1.CancelJobResponse{Success: true}, nil
