@@ -15,7 +15,7 @@ import (
 func openTempStore(t *testing.T) *internal.Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "pool.db")
-	s, err := internal.OpenStore(path, 60)
+	s, err := internal.OpenStore(context.Background(), path, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,16 +24,17 @@ func openTempStore(t *testing.T) *internal.Store {
 }
 
 func TestAssignPrefersGPU(t *testing.T) {
+	ctx := context.Background()
 	s := openTempStore(t)
-	cpu, err := s.RegisterWorker(internal.Worker{NodeID: "n1", GRPCAddr: ":9525", Capacity: 2})
+	cpu, err := s.RegisterWorker(ctx, internal.Worker{NodeID: "n1", GRPCAddr: ":9525", Capacity: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	gpu, err := s.RegisterWorker(internal.Worker{NodeID: "n2", GRPCAddr: ":9526", GPU: true, Capacity: 2})
+	gpu, err := s.RegisterWorker(ctx, internal.Worker{NodeID: "n2", GRPCAddr: ":9526", GPU: true, Capacity: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := s.Enqueue(internal.Job{
+	job, err := s.Enqueue(ctx, internal.Job{
 		InputPath: "/in.mkv", OutputPath: "/out.mkv", PreferGPU: true, Profile: "hevc_gpu",
 	})
 	if err != nil {
@@ -42,23 +43,24 @@ func TestAssignPrefersGPU(t *testing.T) {
 	if job.Status != "assigned" || job.WorkerID != gpu.ID {
 		t.Fatalf("job=%+v cpu=%s gpu=%s", job, cpu.ID, gpu.ID)
 	}
-	workers := s.ListWorkers(true)
+	workers := s.ListWorkers(ctx, true)
 	if len(workers) != 1 || workers[0].ActiveJobs != 1 {
 		t.Fatalf("%+v", workers)
 	}
 }
 
 func TestQueueWhenNoCapacity(t *testing.T) {
+	ctx := context.Background()
 	s := openTempStore(t)
-	_, err := s.RegisterWorker(internal.Worker{GRPCAddr: ":1", Capacity: 1, ActiveJobs: 0})
+	_, err := s.RegisterWorker(ctx, internal.Worker{GRPCAddr: ":1", Capacity: 1, ActiveJobs: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	j1, err := s.Enqueue(internal.Job{InputPath: "a", OutputPath: "b"})
+	j1, err := s.Enqueue(ctx, internal.Job{InputPath: "a", OutputPath: "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	j2, err := s.Enqueue(internal.Job{InputPath: "c", OutputPath: "d"})
+	j2, err := s.Enqueue(ctx, internal.Job{InputPath: "c", OutputPath: "d"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,24 +70,25 @@ func TestQueueWhenNoCapacity(t *testing.T) {
 	if j2.Status != "queued" {
 		t.Fatalf("j2=%+v", j2)
 	}
-	if err := s.CancelJob(j1.ID); err != nil {
+	if err := s.CancelJob(ctx, j1.ID); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestDurableJobQueueSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "pool.db")
-	s1, err := internal.OpenStore(path, 60)
+	s1, err := internal.OpenStore(ctx, path, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := s1.RegisterWorker(internal.Worker{
+	w, err := s1.RegisterWorker(ctx, internal.Worker{
 		ID: "tw_cpu1", NodeID: "node-a", GRPCAddr: "127.0.0.1:19001", Capacity: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := s1.Enqueue(internal.Job{
+	job, err := s1.Enqueue(ctx, internal.Job{
 		InputPath: "/media/in.mkv", OutputPath: "/media/out.mkv", Profile: "h264_fast",
 	})
 	if err != nil {
@@ -99,24 +102,24 @@ func TestDurableJobQueueSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := internal.OpenStore(path, 60)
+	s2, err := internal.OpenStore(ctx, path, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
 
-	got, err := s2.GetJob(jobID)
+	got, err := s2.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Status != "assigned" || got.WorkerID != w.ID || got.InputPath != "/media/in.mkv" {
 		t.Fatalf("job not durable: %+v", got)
 	}
-	workers := s2.ListWorkers(false)
+	workers := s2.ListWorkers(ctx, false)
 	if len(workers) != 1 || workers[0].ID != w.ID || workers[0].ActiveJobs != 1 {
 		t.Fatalf("workers not durable: %+v", workers)
 	}
-	queued := s2.ListJobs("assigned")
+	queued := s2.ListJobs(ctx, "assigned")
 	if len(queued) != 1 || queued[0].ID != jobID {
 		t.Fatalf("list jobs: %+v", queued)
 	}
