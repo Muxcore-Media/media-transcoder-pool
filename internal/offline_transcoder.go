@@ -101,6 +101,18 @@ func (t *OfflineTranscoder) GetJob(_ context.Context, req *transcodev1.GetJobReq
 	return &transcodev1.GetJobResponse{Job: cloned}, nil
 }
 
+func (t *OfflineTranscoder) CancelJob(_ context.Context, req *transcodev1.CancelJobRequest) (*transcodev1.CancelJobResponse, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	j, ok := t.jobs[req.GetJobId()]
+	if !ok {
+		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
+	}
+	j.Status = "cancelled"
+	j.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return &transcodev1.CancelJobResponse{}, nil
+}
+
 func (t *OfflineTranscoder) ListProfiles(context.Context, *transcodev1.ListProfilesRequest) (*transcodev1.ListProfilesResponse, error) {
 	return &transcodev1.ListProfilesResponse{Profiles: []*transcodev1.TranscodeProfile{{
 		Id: "h264_fast", Name: "H.264 Fast", VideoCodec: "h264", AudioCodec: "copy", Preset: "fast", Crf: 23, Container: "mkv",

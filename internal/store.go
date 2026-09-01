@@ -34,6 +34,7 @@ type Job struct {
 	OutputPath  string
 	Profile     string
 	WorkerID    string
+	RemoteJobID string
 	Status      string
 	Error       string
 	CreatedUnix int64
@@ -97,6 +98,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			profile TEXT NOT NULL DEFAULT 'h264_fast',
 			prefer_gpu INTEGER NOT NULL DEFAULT 0,
 			worker_id TEXT NOT NULL DEFAULT '',
+			remote_job_id TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'queued',
 			error TEXT NOT NULL DEFAULT '',
 			created_unix INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +110,33 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	if err := s.addColumnIfMissing(ctx, "jobs", "remote_job_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) addColumnIfMissing(ctx context.Context, table, column, def string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("pragma table_info %s: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, def)); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -117,6 +146,16 @@ func (s *Store) Path() string {
 		return ""
 	}
 	return s.path
+}
+
+// Ping verifies the SQLite connection is alive.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store closed")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.PingContext(ctx)
 }
 
 // Close closes the database.
@@ -179,12 +218,12 @@ func (s *Store) RegisterWorker(ctx context.Context, w Worker) (*Worker, error) {
 	return out, nil
 }
 
-func (s *Store) Heartbeat(ctx context.Context, id string, active int32) error {
+func (s *Store) Heartbeat(ctx context.Context, id string, _ int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE workers SET active_jobs = ?, last_heartbeat_unix = ?, status = 'online' WHERE id = ?
-	`, active, time.Now().Unix(), id)
+		UPDATE workers SET last_heartbeat_unix = ?, status = 'online' WHERE id = ?
+	`, time.Now().Unix(), id)
 	if err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}
@@ -201,7 +240,15 @@ func (s *Store) Heartbeat(ctx context.Context, id string, active int32) error {
 func (s *Store) UnregisterWorker(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.ExecContext(ctx, `DELETE FROM workers WHERE id = ?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.requeueWorkerJobsLocked(ctx, tx, id, false); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM workers WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("unregister: %w", err)
 	}
@@ -212,7 +259,98 @@ func (s *Store) UnregisterWorker(ctx context.Context, id string) error {
 	if n == 0 {
 		return fmt.Errorf("worker %q not found", id)
 	}
-	return nil
+	return tx.Commit()
+}
+
+// SweepStaleWorkers requeues assigned/running jobs owned by stale or offline workers.
+func (s *Store) SweepStaleWorkers(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, last_heartbeat_unix FROM workers
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("list workers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	requeued := 0
+	for rows.Next() {
+		var id string
+		var lastHB int64
+		if err := rows.Scan(&id, &lastHB); err != nil {
+			return requeued, err
+		}
+		st := statusFor(lastHB, now, s.staleAfterSec)
+		if st != "stale" && st != "offline" {
+			continue
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return requeued, err
+		}
+		n, err := s.requeueWorkerJobsLocked(ctx, tx, id, true)
+		if err != nil {
+			_ = tx.Rollback()
+			return requeued, err
+		}
+		if err := tx.Commit(); err != nil {
+			return requeued, err
+		}
+		if n > 0 {
+			requeued++
+		}
+	}
+	return requeued, rows.Err()
+}
+
+func (s *Store) requeueWorkerJobsLocked(ctx context.Context, tx *sql.Tx, workerID string, promote bool) (int, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM jobs
+		WHERE worker_id = ? AND status IN ('assigned', 'running')
+		ORDER BY created_unix ASC, id ASC
+	`, workerID)
+	if err != nil {
+		return 0, fmt.Errorf("list worker jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	jobIDs := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		jobIDs = append(jobIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(jobIDs) == 0 {
+		return 0, nil
+	}
+	now := time.Now().Unix()
+	for _, id := range jobIDs {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET status = 'queued', worker_id = '', remote_job_id = '', updated_unix = ?
+			WHERE id = ?
+		`, now, id); err != nil {
+			return 0, fmt.Errorf("requeue job %q: %w", id, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE workers SET active_jobs = CASE WHEN active_jobs > ? THEN active_jobs - ? ELSE 0 END
+		WHERE id = ?
+	`, len(jobIDs), len(jobIDs), workerID); err != nil {
+		return 0, fmt.Errorf("release worker load: %w", err)
+	}
+	if promote {
+		if err := s.promoteQueuedJobsLocked(ctx, tx, now); err != nil {
+			return 0, err
+		}
+	}
+	return len(jobIDs), nil
 }
 
 func (s *Store) ListWorkers(ctx context.Context, gpuOnly bool) []*Worker {
@@ -260,7 +398,7 @@ func (s *Store) Enqueue(ctx context.Context, j Job) (*Job, error) {
 	j.Status = "queued"
 	j.WorkerID = ""
 
-	workerID, err := s.pickWorkerLocked(ctx, j.PreferGPU, now)
+	workerID, err := s.pickWorkerLocked(ctx, nil, j.PreferGPU, now)
 	if err != nil {
 		return nil, err
 	}
@@ -278,8 +416,8 @@ func (s *Store) Enqueue(ctx context.Context, j Job) (*Job, error) {
 		}
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix)
-		VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+		INSERT INTO jobs (id, input_path, output_path, profile, prefer_gpu, worker_id, remote_job_id, status, error, created_unix, updated_unix)
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, '', ?, ?)
 	`, j.ID, j.InputPath, j.OutputPath, j.Profile, boolToInt(j.PreferGPU), j.WorkerID, j.Status, j.CreatedUnix, j.UpdatedUnix)
 	if err != nil {
 		return nil, fmt.Errorf("insert job: %w", err)
@@ -291,11 +429,20 @@ func (s *Store) Enqueue(ctx context.Context, j Job) (*Job, error) {
 	return &out, nil
 }
 
-func (s *Store) pickWorkerLocked(ctx context.Context, preferGPU bool, now int64) (string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
-		FROM workers
-	`)
+func (s *Store) pickWorkerLocked(ctx context.Context, tx *sql.Tx, preferGPU bool, now int64) (string, error) {
+	var rows *sql.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
+			FROM workers
+		`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT id, node_id, grpc_addr, gpu, capacity, active_jobs, labels, last_heartbeat_unix, status
+			FROM workers
+		`)
+	}
 	if err != nil {
 		return "", fmt.Errorf("list workers for pick: %w", err)
 	}
@@ -318,7 +465,6 @@ func (s *Store) pickWorkerLocked(ctx context.Context, preferGPU bool, now int64)
 			continue
 		}
 		load := float64(w.ActiveJobs) / float64(w.Capacity)
-		// Prefer GPU workers when available even if preferGPU is false.
 		if w.GPU {
 			load -= 0.01
 		}
@@ -331,9 +477,44 @@ func (s *Store) pickWorkerLocked(ctx context.Context, preferGPU bool, now int64)
 		return "", err
 	}
 	if preferGPU && bestID == "" {
-		return s.pickWorkerLocked(ctx, false, now)
+		return s.pickWorkerLocked(ctx, tx, false, now)
 	}
 	return bestID, nil
+}
+
+func (s *Store) promoteQueuedJobsLocked(ctx context.Context, tx *sql.Tx, now int64) error {
+	for {
+		var jobID string
+		var preferGPU int
+		err := tx.QueryRowContext(ctx, `
+			SELECT id, prefer_gpu FROM jobs
+			WHERE status = 'queued'
+			ORDER BY created_unix ASC, id ASC
+			LIMIT 1
+		`).Scan(&jobID, &preferGPU)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("pick queued job: %w", err)
+		}
+		workerID, err := s.pickWorkerLocked(ctx, tx, preferGPU != 0, now)
+		if err != nil {
+			return err
+		}
+		if workerID == "" {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE workers SET active_jobs = active_jobs + 1 WHERE id = ?`, workerID); err != nil {
+			return fmt.Errorf("bump worker load: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET status = 'assigned', worker_id = ?, updated_unix = ?
+			WHERE id = ?
+		`, workerID, now, jobID); err != nil {
+			return fmt.Errorf("assign queued job: %w", err)
+		}
+	}
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
@@ -346,11 +527,11 @@ func (s *Store) getJobLocked(ctx context.Context, id string) (*Job, error) {
 	var j Job
 	var preferGPU int
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
+		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, remote_job_id, status, error, created_unix, updated_unix
 		FROM jobs WHERE id = ?
 	`, id).Scan(
 		&j.ID, &j.InputPath, &j.OutputPath, &j.Profile, &preferGPU,
-		&j.WorkerID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
+		&j.WorkerID, &j.RemoteJobID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("job %q not found", id)
@@ -366,7 +547,7 @@ func (s *Store) ListJobs(ctx context.Context, status string) []*Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, status, error, created_unix, updated_unix
+		SELECT id, input_path, output_path, profile, prefer_gpu, worker_id, remote_job_id, status, error, created_unix, updated_unix
 		FROM jobs
 		WHERE (? = '' OR lower(status) = lower(?))
 		ORDER BY created_unix ASC, id ASC
@@ -381,7 +562,7 @@ func (s *Store) ListJobs(ctx context.Context, status string) []*Job {
 		var preferGPU int
 		if err := rows.Scan(
 			&j.ID, &j.InputPath, &j.OutputPath, &j.Profile, &preferGPU,
-			&j.WorkerID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
+			&j.WorkerID, &j.RemoteJobID, &j.Status, &j.Error, &j.CreatedUnix, &j.UpdatedUnix,
 		); err != nil {
 			return out
 		}
@@ -407,6 +588,7 @@ func (s *Store) CancelJob(ctx context.Context, id string) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	now := time.Now().Unix()
 	if j.WorkerID != "" {
 		if _, relErr := tx.ExecContext(ctx, `
 			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
@@ -415,10 +597,35 @@ func (s *Store) CancelJob(ctx context.Context, id string) error {
 			return fmt.Errorf("release worker load: %w", relErr)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET status = 'cancelled', updated_unix = ? WHERE id = ?`, time.Now().Unix(), id); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET status = 'cancelled', remote_job_id = '', updated_unix = ? WHERE id = ?
+	`, now, id); err != nil {
 		return fmt.Errorf("cancel job: %w", err)
 	}
+	if err := s.promoteQueuedJobsLocked(ctx, tx, now); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// SetJobRemoteID persists the worker-side job id for resume-after-restart.
+func (s *Store) SetJobRemoteID(ctx context.Context, id, remoteID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET remote_job_id = ?, updated_unix = ? WHERE id = ?
+	`, remoteID, time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("set remote job id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("job %q not found", id)
+	}
+	return nil
 }
 
 // GetWorker returns a worker by id (status refreshed from heartbeat age).
@@ -461,6 +668,7 @@ func (s *Store) setJobStatus(ctx context.Context, id, status, errMsg string, rel
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	now := time.Now().Unix()
 	if releaseWorker && j.WorkerID != "" {
 		if _, relErr := tx.ExecContext(ctx, `
 			UPDATE workers SET active_jobs = CASE WHEN active_jobs > 0 THEN active_jobs - 1 ELSE 0 END
@@ -469,10 +677,19 @@ func (s *Store) setJobStatus(ctx context.Context, id, status, errMsg string, rel
 			return fmt.Errorf("release worker load: %w", relErr)
 		}
 	}
+	remoteClear := ""
+	if releaseWorker {
+		remoteClear = ""
+	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET status = ?, error = ?, updated_unix = ? WHERE id = ?
-	`, status, errMsg, time.Now().Unix(), id); err != nil {
+		UPDATE jobs SET status = ?, error = ?, remote_job_id = ?, updated_unix = ? WHERE id = ?
+	`, status, errMsg, remoteClear, now, id); err != nil {
 		return fmt.Errorf("update job status: %w", err)
+	}
+	if releaseWorker {
+		if err := s.promoteQueuedJobsLocked(ctx, tx, now); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

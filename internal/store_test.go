@@ -73,6 +73,133 @@ func TestQueueWhenNoCapacity(t *testing.T) {
 	if err := s.CancelJob(ctx, j1.ID); err != nil {
 		t.Fatal(err)
 	}
+	j2After, err := s.GetJob(ctx, j2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j2After.Status != "assigned" {
+		t.Fatalf("j2 not promoted after j1 cancel: %+v", j2After)
+	}
+}
+
+func TestMarkJobDonePromotesQueued(t *testing.T) {
+	ctx := context.Background()
+	s := openTempStore(t)
+	w, err := s.RegisterWorker(ctx, internal.Worker{GRPCAddr: ":1", Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	j1, err := s.Enqueue(ctx, internal.Job{InputPath: "a", OutputPath: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, err := s.Enqueue(ctx, internal.Job{InputPath: "c", OutputPath: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j2.Status != "queued" {
+		t.Fatalf("j2=%+v", j2)
+	}
+	if err := s.MarkJobDone(ctx, j1.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetJob(ctx, j2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "assigned" || got.WorkerID != w.ID {
+		t.Fatalf("j2 not promoted: %+v worker=%s", got, w.ID)
+	}
+}
+
+func TestHeartbeatDoesNotResetActiveJobs(t *testing.T) {
+	ctx := context.Background()
+	s := openTempStore(t)
+	w, err := s.RegisterWorker(ctx, internal.Worker{ID: "w1", GRPCAddr: ":1", Capacity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue(ctx, internal.Job{InputPath: "a", OutputPath: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	workers := s.ListWorkers(ctx, false)
+	if len(workers) != 1 || workers[0].ActiveJobs != 1 {
+		t.Fatalf("before heartbeat: %+v", workers)
+	}
+	if err := s.Heartbeat(ctx, w.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	workers = s.ListWorkers(ctx, false)
+	if len(workers) != 1 || workers[0].ActiveJobs != 1 {
+		t.Fatalf("heartbeat must not overwrite active_jobs: %+v", workers)
+	}
+}
+
+func TestResumeRunningJobAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pool.db")
+	s1, err := internal.OpenStore(ctx, path, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := s1.RegisterWorker(ctx, internal.Worker{GRPCAddr: "127.0.0.1:1", Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s1.Enqueue(ctx, internal.Job{InputPath: "in", OutputPath: "out"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.MarkJobRunning(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SetJobRemoteID(ctx, job.ID, "remote-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := internal.OpenStore(ctx, path, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	got, err := s2.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "running" || got.RemoteJobID != "remote-abc" || got.WorkerID != w.ID {
+		t.Fatalf("job not durable for resume: %+v", got)
+	}
+	running := s2.ListJobs(ctx, "running")
+	if len(running) != 1 || running[0].ID != job.ID {
+		t.Fatalf("list running: %+v", running)
+	}
+}
+
+func TestUnregisterWorkerRequeuesJobs(t *testing.T) {
+	ctx := context.Background()
+	s := openTempStore(t)
+	w, err := s.RegisterWorker(ctx, internal.Worker{ID: "w1", GRPCAddr: ":1", Capacity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Enqueue(ctx, internal.Job{InputPath: "a", OutputPath: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UnregisterWorker(ctx, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "queued" || got.WorkerID != "" {
+		t.Fatalf("job not requeued: %+v", got)
+	}
 }
 
 func TestDurableJobQueueSurvivesReopen(t *testing.T) {
@@ -129,9 +256,10 @@ func TestFakeWorkerRegisterHeartbeatEnqueue(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "pool.db")
 	m := internal.NewModule(internal.Config{
-		DBPath:   dbPath,
-		GRPCAddr: "127.0.0.1:0",
-		HTTPAddr: "127.0.0.1:0",
+		DBPath:          dbPath,
+		GRPCAddr:        "127.0.0.1:0",
+		HTTPAddr:        "127.0.0.1:0",
+		DisableDispatch: true,
 	})
 	if err := m.Init(ctx); err != nil {
 		t.Fatal(err)
