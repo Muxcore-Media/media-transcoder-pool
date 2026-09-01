@@ -15,6 +15,7 @@ import (
 
 // TestLocalSingleWorkerDemo wires pool + offline media-transcoder mock (no GPU, no FFmpeg).
 func TestLocalSingleWorkerDemo(t *testing.T) {
+	t.Setenv("MUXCORE_INSECURE_DISABLE_TLS", "true")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -36,10 +37,6 @@ func TestLocalSingleWorkerDemo(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Stop(context.Background()) })
-
-	store := m.Store()
-	disp := internal.NewDispatcher(store, internal.GRPCTranscoderDialer)
-	go disp.Run(ctx)
 
 	conn, err := grpc.NewClient(m.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {

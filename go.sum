@@ -1,5 +1,7 @@
 github.com/Muxcore-Media/contracts-media v0.1.0 h1:kjUfy9U5nPvImjAnfGpiLjRxp739YH2eA93c+tZ7nW8=
 github.com/Muxcore-Media/contracts-media v0.1.0/go.mod h1:cYmz14RYUL0VxnVRNSCz0n1HOjjL1yzbpDWdWdkd+BI=
+github.com/Muxcore-Media/core/pkg/tenant v0.5.8 h1:vAwpGgRsG7B5511Ck1DeF3fCX90TTIQ6tPX2+ZaUxGI=
+github.com/Muxcore-Media/core/pkg/tenant v0.5.8/go.mod h1:20OPZUgeO0MFmoxkymxM+qeylxkwt+qk9qjcSn4Rr58=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
