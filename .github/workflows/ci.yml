@@ -12,7 +12,9 @@ jobs:
   lint:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
+        with:
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
@@ -25,7 +27,9 @@ jobs:
   test:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
+        with:
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
@@ -38,7 +42,9 @@ jobs:
   build:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
+        with:
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
