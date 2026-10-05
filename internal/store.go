@@ -245,8 +245,8 @@ func (s *Store) UnregisterWorker(ctx context.Context, id string) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := s.requeueWorkerJobsLocked(ctx, tx, id, false); err != nil {
-		return err
+	if _, requeueErr := s.requeueWorkerJobsLocked(ctx, tx, id, false); requeueErr != nil {
+		return requeueErr
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM workers WHERE id = ?`, id)
 	if err != nil {

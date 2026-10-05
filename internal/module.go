@@ -43,8 +43,8 @@ type Module struct {
 type Config struct {
 	ID, GRPCAddr, HTTPAddr, DBPath string
 	StaleAfterSec                  int64
-	Dispatch                       bool // forward assigned jobs to worker TranscodeService
 	DispatchTimeoutSec             int64
+	Dispatch                       bool // forward assigned jobs to worker TranscodeService
 	DisableDispatch                bool // test hook; POOL_DISPATCH env overrides when set
 }
 
@@ -64,10 +64,7 @@ func NewModule(cfg Config) *Module {
 	if cfg.DispatchTimeoutSec <= 0 {
 		cfg.DispatchTimeoutSec = defaultDispatchTimeoutSec
 	}
-	dispatch := true
-	if cfg.DisableDispatch {
-		dispatch = false
-	}
+	dispatch := !cfg.DisableDispatch
 	if v := os.Getenv("POOL_DISPATCH"); v == "0" || v == "false" {
 		dispatch = false
 	} else if v == "1" || v == "true" {
