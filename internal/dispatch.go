@@ -11,6 +11,8 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
+
 	"github.com/Muxcore-Media/media-transcoder-pool/internal/transcodev1"
 )
 
@@ -29,11 +31,7 @@ type TranscoderDialer func(ctx context.Context, grpcAddr string) (TranscoderSess
 
 // GRPCTranscoderDialer dials a real media-transcoder TranscodeService (or compatible mock).
 func GRPCTranscoderDialer(ctx context.Context, grpcAddr string) (TranscoderSession, error) {
-	opts, err := meshGRPCDialOptions()
-	if err != nil {
-		return nil, err
-	}
-	conn, err := grpc.NewClient(grpcAddr, opts...)
+	conn, err := meshtls.Dial(grpcAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial transcoder %s: %w", grpcAddr, err)
 	}

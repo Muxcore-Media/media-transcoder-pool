@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Muxcore-Media/media-transcoder-pool/internal/transcodev1"
@@ -34,11 +36,16 @@ func StartOfflineTranscoder(addr string) (*OfflineTranscoder, error) {
 	if err != nil {
 		return nil, err
 	}
+	srvOpt, err := meshtls.ServerOption()
+	if err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
 	t := &OfflineTranscoder{
 		jobs: make(map[string]*transcodev1.TranscodeJob),
 		lis:  lis,
 		addr: lis.Addr().String(),
-		srv:  grpc.NewServer(),
+		srv:  grpc.NewServer(srvOpt),
 	}
 	transcodev1.RegisterTranscodeServiceServer(t.srv, t)
 	go func() { _ = t.srv.Serve(lis) }()

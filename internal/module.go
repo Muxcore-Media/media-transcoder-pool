@@ -17,6 +17,7 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 	manifest "github.com/Muxcore-Media/media-transcoder-pool"
 	poolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 )
@@ -128,7 +129,11 @@ func (m *Module) Start(ctx context.Context) error {
 	}
 	m.lis = lis
 	m.grpcAddr = lis.Addr().String()
-	m.grpcSrv = grpc.NewServer()
+	srvOpt, err := meshtls.ServerOption()
+	if err != nil {
+		return fmt.Errorf("grpc mesh TLS: %w", err)
+	}
+	m.grpcSrv = grpc.NewServer(srvOpt)
 	poolv1.RegisterTranscoderPoolServiceServer(m.grpcSrv, &poolServer{m: m})
 	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
 	go func() {

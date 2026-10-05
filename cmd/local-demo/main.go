@@ -15,9 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 	"github.com/Muxcore-Media/media-transcoder-pool/internal"
 	poolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 )
@@ -30,6 +28,10 @@ func main() {
 }
 
 func run() error {
+	// Laptop-only demo: plaintext on loopback is explicit (dev profile only).
+	if os.Getenv("MUXCORE_PROFILE") == "" && os.Getenv("MUXCORE_TLS_CERT") == "" && !meshtls.Insecure() {
+		_ = os.Setenv("MUXCORE_INSECURE_DISABLE_TLS", "true")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -69,7 +71,7 @@ func run() error {
 	}
 	defer func() { _ = m.Stop(context.Background()) }()
 
-	conn, err := grpc.NewClient(m.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := meshtls.Dial(m.GRPCAddr())
 	if err != nil {
 		return err
 	}
