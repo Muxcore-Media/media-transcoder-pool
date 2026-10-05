@@ -17,6 +17,7 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	manifest "github.com/Muxcore-Media/media-transcoder-pool"
 	poolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 )
 
@@ -98,7 +99,7 @@ func NewModule(cfg Config) *Module {
 
 func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
-		ID: m.id, Name: "Transcoder Pool", Version: "0.2.0",
+		ID: m.id, Name: "Transcoder Pool", Version: modulesdk.ManifestVersion(manifest.ManifestJSON),
 		Roles:        []string{"media", "transcode", "pool"},
 		Description:  "Distributed transcoding pool coordinator (GPU/CPU workers on the mesh)",
 		Capabilities: []string{"media.transcode.pool", "transcoder.pool", "settings"},
