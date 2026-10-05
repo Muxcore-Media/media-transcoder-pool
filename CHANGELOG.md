@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-10-05
+
+
+### Fixed
+- `SweepStaleWorkers` deadlocked (single SQLite connection) whenever a worker was stale/offline: it opened a transaction while the workers cursor was still open. The cursor is now drained and closed before requeue writes.
+
 ## [0.2.0] - 2026-10-05
 
 ### Changed

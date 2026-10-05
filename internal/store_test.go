@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -325,5 +326,54 @@ func TestFakeWorkerRegisterHeartbeatEnqueue(t *testing.T) {
 	}
 	if len(workers.Workers) != 1 || workers.Workers[0].GetActiveJobs() != 1 {
 		t.Fatalf("workers=%+v", workers.Workers)
+	}
+}
+
+// TestSweepStaleWorkersDoesNotDeadlock guards against issuing writes while the
+// worker cursor is still open (the pool is capped at one connection).
+func TestSweepStaleWorkersDoesNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s := openTempStore(t)
+	s.SetStaleAfterSec(1)
+	w, err := s.RegisterWorker(ctx, internal.Worker{GRPCAddr: ":1", Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Enqueue(ctx, internal.Job{InputPath: "a", OutputPath: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "assigned" || job.WorkerID != w.ID {
+		t.Fatalf("setup: %+v", job)
+	}
+	time.Sleep(2200 * time.Millisecond) // age > staleAfterSec
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := s.SweepStaleWorkers(ctx)
+		done <- result{n, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.n != 1 {
+			t.Fatalf("requeued=%d want 1", r.n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SweepStaleWorkers hung (cursor held open across write)")
+	}
+	got, err := s.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "queued" || got.WorkerID != "" {
+		t.Fatalf("job not requeued: %+v", got)
 	}
 }

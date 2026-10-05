@@ -273,19 +273,31 @@ func (s *Store) SweepStaleWorkers(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("list workers: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	requeued := 0
+	// Drain the cursor before issuing writes: the pool is limited to a single
+	// connection, so opening a transaction while rows are open would deadlock.
+	var staleIDs []string
 	for rows.Next() {
 		var id string
 		var lastHB int64
 		if err := rows.Scan(&id, &lastHB); err != nil {
-			return requeued, err
+			_ = rows.Close()
+			return 0, err
 		}
 		st := statusFor(lastHB, now, s.staleAfterSec)
-		if st != "stale" && st != "offline" {
-			continue
+		if st == "stale" || st == "offline" {
+			staleIDs = append(staleIDs, id)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	requeued := 0
+	for _, id := range staleIDs {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return requeued, err
@@ -302,7 +314,7 @@ func (s *Store) SweepStaleWorkers(ctx context.Context) (int, error) {
 			requeued++
 		}
 	}
-	return requeued, rows.Err()
+	return requeued, nil
 }
 
 func (s *Store) requeueWorkerJobsLocked(ctx context.Context, tx *sql.Tx, workerID string, promote bool) (int, error) {
